@@ -979,7 +979,8 @@ if (args.uploadToSameFolder) {
 try {
 const docInfo = await drive.files.get({
 fileId: args.documentId,
-fields: 'parents'
+fields: 'parents',
+supportsAllDrives: true,
 });
 if (docInfo.data.parents && docInfo.data.parents.length > 0) {
 parentFolderId = docInfo.data.parents[0];
@@ -1454,6 +1455,9 @@ try {
     pageSize: args.maxResults,
     orderBy: args.orderBy === 'name' ? 'name' : args.orderBy,
     fields: 'files(id,name,modifiedTime,createdTime,size,webViewLink,owners(displayName,emailAddress))',
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+    corpora: 'allDrives',
   });
 
   const files = response.data.files || [];
@@ -1517,6 +1521,9 @@ try {
     pageSize: args.maxResults,
     orderBy: 'modifiedTime desc',
     fields: 'files(id,name,modifiedTime,createdTime,webViewLink,owners(displayName),parents)',
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+    corpora: 'allDrives',
   });
 
   const files = response.data.files || [];
@@ -1568,6 +1575,9 @@ try {
     pageSize: args.maxResults,
     orderBy: 'modifiedTime desc',
     fields: 'files(id,name,modifiedTime,createdTime,webViewLink,owners(displayName),lastModifyingUser(displayName))',
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+    corpora: 'allDrives',
   });
 
   const files = response.data.files || [];
@@ -1612,6 +1622,7 @@ try {
     // Note: 'permissions' and 'alternateLink' fields removed - they cause
     // "Invalid field selection" errors for Google Docs files
     fields: 'id,name,description,mimeType,size,createdTime,modifiedTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName,emailAddress),shared,parents,version',
+    supportsAllDrives: true,
   });
 
   const file = response.data;
@@ -1685,6 +1696,7 @@ try {
   const response = await drive.files.create({
     requestBody: folderMetadata,
     fields: 'id,name,parents,webViewLink',
+    supportsAllDrives: true,
   });
 
   const folder = response.data;
@@ -1730,6 +1742,9 @@ try {
     pageSize: args.maxResults,
     orderBy: 'folder,name',
     fields: 'files(id,name,mimeType,size,modifiedTime,webViewLink,owners(displayName))',
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+    corpora: 'allDrives',
   });
 
   const items = response.data.files || [];
@@ -1794,6 +1809,7 @@ try {
   const response = await drive.files.get({
     fileId: args.folderId,
     fields: 'id,name,description,createdTime,modifiedTime,webViewLink,owners(displayName,emailAddress),lastModifyingUser(displayName),shared,parents',
+    supportsAllDrives: true,
   });
 
   const folder = response.data;
@@ -1861,6 +1877,7 @@ try {
   const fileInfo = await drive.files.get({
     fileId: args.fileId,
     fields: 'name,parents',
+    supportsAllDrives: true,
   });
 
   const fileName = fileInfo.data.name;
@@ -1870,6 +1887,7 @@ try {
     fileId: args.fileId,
     addParents: args.newParentId,
     fields: 'id,name,parents',
+    supportsAllDrives: true,
   };
 
   if (args.removeFromAllParents && currentParents.length > 0) {
@@ -1906,6 +1924,7 @@ try {
   const originalFile = await drive.files.get({
     fileId: args.fileId,
     fields: 'name,parents',
+    supportsAllDrives: true,
   });
 
   const copyMetadata: drive_v3.Schema$File = {
@@ -1922,6 +1941,7 @@ try {
     fileId: args.fileId,
     requestBody: copyMetadata,
     fields: 'id,name,webViewLink',
+    supportsAllDrives: true,
   });
 
   const copiedFile = response.data;
@@ -1953,6 +1973,7 @@ try {
       name: args.newName,
     },
     fields: 'id,name,webViewLink',
+    supportsAllDrives: true,
   });
 
   const file = response.data;
@@ -1968,45 +1989,22 @@ try {
 
 server.addTool({
 name: 'deleteFile',
-description: 'Permanently deletes a file or folder from Google Drive.',
+description: '⛔ DISABLED FOR SAFETY - File deletion is disabled in this configuration. Use moveFile to relocate files instead, or delete manually via Google Drive web interface.',
 parameters: z.object({
   fileId: z.string().describe('ID of the file or folder to delete.'),
   skipTrash: z.boolean().optional().default(false).describe('If true, permanently deletes the file. If false, moves to trash (can be restored).'),
 }),
 execute: async (args, { log }) => {
-const drive = await getDriveClient();
-log.info(`Deleting file ${args.fileId} ${args.skipTrash ? '(permanent)' : '(to trash)'}`);
-
-try {
-  // Get file info before deletion
-  const fileInfo = await drive.files.get({
-    fileId: args.fileId,
-    fields: 'name,mimeType',
-  });
-
-  const fileName = fileInfo.data.name;
-  const isFolder = fileInfo.data.mimeType === 'application/vnd.google-apps.folder';
-
-  if (args.skipTrash) {
-    await drive.files.delete({
-      fileId: args.fileId,
-    });
-    return `Permanently deleted ${isFolder ? 'folder' : 'file'} "${fileName}".`;
-  } else {
-    await drive.files.update({
-      fileId: args.fileId,
-      requestBody: {
-        trashed: true,
-      },
-    });
-    return `Moved ${isFolder ? 'folder' : 'file'} "${fileName}" to trash. It can be restored from the trash.`;
-  }
-} catch (error: any) {
-  log.error(`Error deleting file: ${error.message || error}`);
-  if (error.code === 404) throw new UserError("File not found. Check the file ID.");
-  if (error.code === 403) throw new UserError("Permission denied. Make sure you have delete access to this file.");
-  throw new UserError(`Failed to delete file: ${error.message || 'Unknown error'}`);
-}
+  log.warn(`deleteFile called but is disabled for safety. File ID: ${args.fileId}`);
+  throw new UserError(
+    "🛡️ FILE DELETION IS DISABLED FOR SAFETY\n\n" +
+    "This MCP server is configured to prevent accidental file deletion.\n\n" +
+    "Alternatives:\n" +
+    "• Use 'moveFile' to relocate files to a different folder\n" +
+    "• Use 'copyFile' to create a backup before manual deletion\n" +
+    "• Delete files manually via Google Drive web interface (drive.google.com)\n\n" +
+    "If you need to enable deletion, modify the deleteFile tool in server.ts"
+  );
 }
 });
 
@@ -2037,6 +2035,7 @@ try {
   const response = await drive.files.create({
     requestBody: documentMetadata,
     fields: 'id,name,webViewLink',
+    supportsAllDrives: true,
   });
 
   const document = response.data;
@@ -2101,6 +2100,7 @@ try {
     fileId: args.templateId,
     requestBody: copyMetadata,
     fields: 'id,name,webViewLink',
+    supportsAllDrives: true,
   });
 
   const document = response.data;
@@ -2379,6 +2379,7 @@ execute: async (args, { log }) => {
     const driveResponse = await drive.files.create({
       requestBody: spreadsheetMetadata,
       fields: 'id,name,webViewLink',
+      supportsAllDrives: true,
     });
 
     const spreadsheetId = driveResponse.data.id;
@@ -2439,6 +2440,9 @@ execute: async (args, { log }) => {
       pageSize: args.maxResults,
       orderBy: args.orderBy === 'name' ? 'name' : args.orderBy,
       fields: 'files(id,name,modifiedTime,createdTime,size,webViewLink,owners(displayName,emailAddress))',
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      corpora: 'allDrives',
     });
 
     const files = response.data.files || [];

@@ -567,7 +567,8 @@ export async function uploadImageToDrive(
     const uploadResponse = await drive.files.create({
         requestBody: fileMetadata,
         media: media,
-        fields: 'id,webViewLink,webContentLink'
+        fields: 'id,webViewLink,webContentLink',
+        supportsAllDrives: true,
     });
 
     const fileId = uploadResponse.data.id;
@@ -587,7 +588,8 @@ export async function uploadImageToDrive(
     // Get the webContentLink
     const fileInfo = await drive.files.get({
         fileId: fileId,
-        fields: 'webContentLink'
+        fields: 'webContentLink',
+        supportsAllDrives: true,
     });
 
     const webContentLink = fileInfo.data.webContentLink;
