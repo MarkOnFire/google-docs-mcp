@@ -1,0 +1,17 @@
+{
+  "instances": {
+    "google-docs-personal": {
+      "env": {
+        "GOOGLE_CREDENTIALS_PATH": "${SERVER_DIR}/credentials/personal/credentials.json",
+        "GOOGLE_TOKEN_PATH": "${SERVER_DIR}/credentials/personal/token.json"
+      }
+    },
+    "google-docs-work": {
+      "env": {
+        "GOOGLE_CREDENTIALS_PATH": "${SERVER_DIR}/credentials/work/credentials.json",
+        "GOOGLE_TOKEN_PATH": "${SERVER_DIR}/credentials/work/token.json"
+      }
+    }
+  },
+  "notes": "Requires OAuth credentials from Google Cloud Console. Each instance needs credentials in its own subdirectory."
+}
