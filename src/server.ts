@@ -1024,6 +1024,80 @@ throw new UserError(`Failed to upload/insert local image: ${error.message || 'Un
 }
 });
 
+// --- File Upload Tool ---
+
+server.addTool({
+name: 'uploadFile',
+description: 'Uploads a file to Google Drive. Supports two modes: (1) base64 mode — pass fileContent with base64-encoded data (for containerized MCP servers), or (2) file-path mode — pass filePath to stream directly from disk (avoids base64 overhead for large files). Exactly one of fileContent or filePath must be provided. The uploaded file inherits the target folder\'s sharing settings. Optionally converts to Google Docs format (useful for uploading HTML that becomes a formatted Google Doc). Returns verified file metadata including size and creation time.',
+parameters: z.object({
+fileName: z.string().optional().describe('Name for the file in Google Drive. Required when using fileContent mode. When using filePath mode, defaults to the filename from the path.'),
+folderId: z.string().describe('ID of the target Google Drive folder.'),
+fileContent: z.string().optional().describe('Base64-encoded file content. The calling agent should read the file and encode it with base64. Mutually exclusive with filePath.'),
+filePath: z.string().optional().describe('Absolute path to a local file to upload via streaming. Avoids base64 encoding overhead. Mutually exclusive with fileContent.'),
+mimeType: z.string().optional().describe('MIME type of the source content. If omitted, auto-detected from the file extension. Common types: application/x-subrip (.srt), text/plain (.txt), text/html (.html), application/pdf (.pdf).'),
+convertToGoogleDoc: z.boolean().optional().default(false).describe('If true, converts the uploaded file to a Google Doc. The source should be a format Drive can convert: text/html (best formatting fidelity), text/plain, application/rtf, or .docx. For formatted transcripts, convert markdown to HTML first, then upload with this flag and mimeType "text/html".'),
+}).refine(
+(data) => (data.fileContent != null) !== (data.filePath != null),
+{ message: 'Exactly one of fileContent or filePath must be provided.' }
+).refine(
+(data) => data.filePath != null || data.fileName != null,
+{ message: 'fileName is required when using fileContent mode.' }
+),
+execute: async (args, { log }) => {
+const drive = await getDriveClient();
+
+const effectiveFileName = args.fileName || (args.filePath ? args.filePath.split('/').pop()! : 'unnamed');
+const resolvedMimeType = args.mimeType || GDocsHelpers.detectMimeType(effectiveFileName);
+const converting = args.convertToGoogleDoc || false;
+const mode = args.filePath ? 'file-path' : 'base64';
+log.info(`Uploading file "${effectiveFileName}" via ${mode} (${resolvedMimeType}${converting ? ' → Google Doc' : ''}) to folder ${args.folderId}`);
+
+try {
+let result: { fileId: string; webViewLink: string; fileName: string; sizeBytes: number };
+
+if (args.filePath) {
+result = await GDocsHelpers.uploadFileFromPathToDrive(
+    drive,
+    args.filePath,
+    resolvedMimeType,
+    args.folderId,
+    converting
+);
+} else {
+result = await GDocsHelpers.uploadFileToDrive(
+    drive,
+    effectiveFileName,
+    args.fileContent!,
+    resolvedMimeType,
+    args.folderId,
+    converting
+);
+}
+
+log.info(`File uploaded successfully: ${result.fileId}${converting ? ' (converted to Google Doc)' : ''}`);
+
+// Verify the upload
+const verification = await GDocsHelpers.verifyUploadedFile(drive, result.fileId);
+
+const sizeMB = (result.sizeBytes / (1024 * 1024)).toFixed(2);
+const lines = [
+`Successfully uploaded "${result.fileName}" to Google Drive${converting ? ' (converted to Google Doc)' : ''}.`,
+`File ID: ${result.fileId}`,
+`Link: ${verification.webViewLink}`,
+`Type: ${verification.mimeType}`,
+`Size: ${result.sizeBytes} bytes (${sizeMB} MB)`,
+`Created: ${verification.createdTime}`,
+`Verified: ${verification.verified ? 'YES' : 'NO (file may still be processing)'}`,
+];
+return lines.join('\n');
+} catch (error: any) {
+log.error(`Error uploading file "${effectiveFileName}": ${error.message || error}`);
+if (error instanceof UserError) throw error;
+throw new UserError(`Failed to upload file: ${error.message || 'Unknown error'}`);
+}
+}
+});
+
 // --- Intelligent Assistance Tools (Examples/Stubs) ---
 
 server.addTool({
@@ -2467,6 +2541,155 @@ execute: async (args, { log }) => {
     log.error(`Error listing Google Sheets: ${error.message || error}`);
     if (error.code === 403) throw new UserError("Permission denied. Make sure you have granted Google Drive access to the application.");
     throw new UserError(`Failed to list spreadsheets: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
+server.addTool({
+name: 'searchDriveFiles',
+description: 'Searches Google Drive for files of any type (not just Google Docs). Use this to find video files, caption files, images, PDFs, and other binary files by name. Unlike searchGoogleDocs which only finds native Google Docs, this searches all file types.',
+parameters: z.object({
+  searchQuery: z.string().min(1).describe('Search term to find in file names.'),
+  mimeType: z.string().optional().describe('Optional MIME type filter (e.g., "video/mp4", "text/vtt", "application/x-subrip"). Only returns files matching this type.'),
+  fileExtension: z.string().optional().describe('Optional file extension filter (e.g., ".srt", ".mp4", ".vtt"). Convenience alternative to mimeType — searches by name suffix.'),
+  folderId: z.string().optional().describe('Optional folder ID to scope the search to a specific Google Drive folder.'),
+  maxResults: z.number().int().min(1).max(100).optional().default(25).describe('Maximum number of results to return.'),
+}),
+execute: async (args, { log }) => {
+  const drive = await getDriveClient();
+  log.info(`Searching Drive files for: "${args.searchQuery}"`);
+
+  try {
+    let queryParts: string[] = ['trashed=false'];
+
+    // Name search
+    queryParts.push(`name contains '${args.searchQuery}'`);
+
+    // MIME type filter
+    if (args.mimeType) {
+      queryParts.push(`mimeType='${args.mimeType}'`);
+    }
+
+    // File extension filter (search by name suffix)
+    if (args.fileExtension) {
+      const ext = args.fileExtension.startsWith('.') ? args.fileExtension : `.${args.fileExtension}`;
+      queryParts.push(`name contains '${ext}'`);
+    }
+
+    // Folder scope
+    if (args.folderId) {
+      queryParts.push(`'${args.folderId}' in parents`);
+    }
+
+    const queryString = queryParts.join(' and ');
+
+    const response = await drive.files.list({
+      q: queryString,
+      pageSize: args.maxResults,
+      orderBy: 'modifiedTime desc',
+      fields: 'files(id,name,mimeType,size,modifiedTime,webViewLink,webContentLink,owners(displayName),parents)',
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      corpora: 'allDrives',
+    });
+
+    const files = response.data.files || [];
+
+    if (files.length === 0) {
+      return `No files found matching "${args.searchQuery}"${args.mimeType ? ` with type ${args.mimeType}` : ''}${args.fileExtension ? ` with extension ${args.fileExtension}` : ''}.`;
+    }
+
+    let result = `Found ${files.length} file(s) matching "${args.searchQuery}":\n\n`;
+    files.forEach((file: any, index: number) => {
+      const modifiedDate = file.modifiedTime ? new Date(file.modifiedTime).toLocaleString() : 'Unknown';
+      const owner = file.owners?.[0]?.displayName || 'Unknown';
+      const sizeStr = file.size ? `${(parseInt(file.size) / 1024 / 1024).toFixed(2)} MB` : 'Unknown size';
+      result += `${index + 1}. **${file.name}**\n`;
+      result += `   ID: ${file.id}\n`;
+      result += `   Type: ${file.mimeType || 'Unknown'}\n`;
+      result += `   Size: ${sizeStr}\n`;
+      result += `   Modified: ${modifiedDate}\n`;
+      result += `   Owner: ${owner}\n`;
+      result += `   Link: ${file.webViewLink || 'N/A'}\n\n`;
+    });
+
+    return result;
+  } catch (error: any) {
+    log.error(`Error searching Drive files: ${error.message || error}`);
+    if (error.code === 403) throw new UserError("Permission denied. Make sure you have granted Google Drive access.");
+    throw new UserError(`Failed to search files: ${error.message || 'Unknown error'}`);
+  }
+}
+});
+
+server.addTool({
+name: 'downloadFile',
+description: 'Downloads a file from Google Drive by its file ID. For small files (under the size threshold, default 25MB), returns the file content as base64-encoded data. For large files, returns a download URL instead. Use searchDriveFiles to find file IDs first. This is the reverse of uploadFile — the calling agent can decode the base64 content and write it locally.',
+parameters: z.object({
+  fileId: z.string().describe('The Google Drive file ID to download.'),
+  maxDownloadSizeMB: z.number().optional().default(25).describe('Maximum file size in MB to download as base64. Files larger than this return a download URL instead. Default: 25MB.'),
+}),
+execute: async (args, { log }) => {
+  const drive = await getDriveClient();
+  log.info(`Downloading file: ${args.fileId}`);
+
+  try {
+    // First, get file metadata to check size and name
+    const metaResponse = await drive.files.get({
+      fileId: args.fileId,
+      fields: 'id,name,mimeType,size,webContentLink,webViewLink',
+      supportsAllDrives: true,
+    });
+
+    const fileMeta = metaResponse.data;
+    const fileName = fileMeta.name || 'unknown';
+    const mimeType = fileMeta.mimeType || 'application/octet-stream';
+    const fileSize = fileMeta.size ? parseInt(fileMeta.size) : 0;
+    const fileSizeMB = fileSize / 1024 / 1024;
+    const maxBytes = args.maxDownloadSizeMB * 1024 * 1024;
+
+    // For Google Docs native types, we can't download raw bytes — suggest export instead
+    if (mimeType.startsWith('application/vnd.google-apps.')) {
+      throw new UserError(
+        `"${fileName}" is a native Google ${mimeType.split('.').pop()} file and cannot be downloaded as a binary file.\n` +
+        `Use readGoogleDoc or readSpreadsheet to access its content instead.`
+      );
+    }
+
+    // Size gate: return URL for large files or when size is unknown
+    const downloadUrl = fileMeta.webContentLink || `https://drive.google.com/uc?id=${args.fileId}&export=download`;
+    if (fileSize > maxBytes) {
+      return `**File too large for direct download** (${fileSizeMB.toFixed(2)} MB > ${args.maxDownloadSizeMB} MB threshold)\n\n` +
+        `**Name:** ${fileName}\n` +
+        `**Type:** ${mimeType}\n` +
+        `**Size:** ${fileSizeMB.toFixed(2)} MB\n` +
+        `**Download URL:** ${downloadUrl}\n\n` +
+        `Use curl or wget to download this file directly:\n` +
+        `\`curl -L -o "${fileName}" "${downloadUrl}"\``;
+    }
+    if (fileSize === 0) {
+      // Size unknown — provide both download URL and attempt base64, but warn
+      log.warn(`File "${fileName}" has no size metadata. Attempting download with caution.`);
+    }
+
+    // Download the file content as base64
+    const { content, sizeBytes } = await GDocsHelpers.downloadFileFromDrive(drive, args.fileId);
+    const actualSizeMB = sizeBytes / 1024 / 1024;
+
+    return JSON.stringify({
+      fileName,
+      mimeType,
+      sizeBytes,
+      sizeMB: parseFloat(actualSizeMB.toFixed(2)),
+      encoding: 'base64',
+      content,
+    });
+  } catch (error: any) {
+    log.error(`Error downloading file ${args.fileId}: ${error.message || error}`);
+    if (error instanceof UserError) throw error;
+    if (error.code === 404) throw new UserError(`File not found (ID: ${args.fileId}). Check the file ID.`);
+    if (error.code === 403) throw new UserError("Permission denied. Make sure you have access to this file.");
+    throw new UserError(`Failed to download file: ${error.message || 'Unknown error'}`);
   }
 }
 });

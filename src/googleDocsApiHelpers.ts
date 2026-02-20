@@ -9,6 +9,57 @@ type Docs = docs_v1.Docs; // Alias for convenience
 // --- Constants ---
 const MAX_BATCH_UPDATE_REQUESTS = 50; // Google API limits batch size
 
+// --- Drive Error Classification ---
+
+export interface DriveErrorInfo {
+    statusCode: number;
+    retryable: boolean;
+    retryAfterSeconds: number | null;
+    userMessage: string;
+}
+
+export function classifyDriveError(error: any, context: string): DriveErrorInfo {
+    const statusCode = error.code || error.response?.status || 0;
+    const message = error.message || 'Unknown error';
+    const retryAfterHeader = error.response?.headers?.['retry-after'];
+
+    switch (statusCode) {
+        case 400:
+            return { statusCode, retryable: false, retryAfterSeconds: null, userMessage: `Bad request during ${context}: ${message}` };
+        case 403: {
+            const isRateLimit = message.toLowerCase().includes('rate limit') || message.toLowerCase().includes('quota');
+            if (isRateLimit) {
+                return { statusCode, retryable: true, retryAfterSeconds: retryAfterHeader ? parseInt(retryAfterHeader, 10) : 60, userMessage: `Rate limited during ${context}. Try again later.` };
+            }
+            return { statusCode, retryable: false, retryAfterSeconds: null, userMessage: `Permission denied during ${context}. Ensure the authenticated account has access.` };
+        }
+        case 404:
+            return { statusCode, retryable: false, retryAfterSeconds: null, userMessage: `Not found during ${context}. Check that the folder ID exists and is accessible.` };
+        case 413:
+            return { statusCode, retryable: false, retryAfterSeconds: null, userMessage: `File too large during ${context}. Google Drive has upload size limits.` };
+        case 429:
+            return { statusCode, retryable: true, retryAfterSeconds: retryAfterHeader ? parseInt(retryAfterHeader, 10) : 60, userMessage: `Rate limited during ${context}. Try again later.` };
+        case 500:
+        case 502:
+        case 503:
+            return { statusCode, retryable: true, retryAfterSeconds: 5, userMessage: `Google server error during ${context}. This is transient — retry shortly.` };
+        default:
+            return { statusCode, retryable: false, retryAfterSeconds: null, userMessage: `Unexpected error during ${context} (HTTP ${statusCode}): ${message}` };
+    }
+}
+
+export function formatUploadError(info: DriveErrorInfo): string {
+    const lines = [
+        `Upload failed: ${info.userMessage}`,
+        `HTTP Status: ${info.statusCode}`,
+        `Retryable: ${info.retryable ? 'YES' : 'NO'}`,
+    ];
+    if (info.retryable && info.retryAfterSeconds != null) {
+        lines.push(`Wait before retry: ${info.retryAfterSeconds}s`);
+    }
+    return lines.join('\n');
+}
+
 // --- Core Helper to Execute Batch Updates ---
 export async function executeBatchUpdate(docs: Docs, documentId: string, requests: docs_v1.Schema$Request[]): Promise<docs_v1.Schema$BatchUpdateDocumentResponse> {
 if (!requests || requests.length === 0) {
@@ -598,6 +649,282 @@ export async function uploadImageToDrive(
     }
 
     return webContentLink;
+}
+
+/**
+ * MIME type map for common file extensions (superset of image types)
+ */
+const mimeTypeMap: { [key: string]: string } = {
+    // Images
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.png': 'image/png',
+    '.gif': 'image/gif',
+    '.bmp': 'image/bmp',
+    '.webp': 'image/webp',
+    '.svg': 'image/svg+xml',
+    // Subtitles / Captions
+    '.srt': 'application/x-subrip',
+    '.vtt': 'text/vtt',
+    '.scc': 'application/x-scc',
+    '.dfxp': 'application/ttml+xml',
+    '.ttml': 'application/ttml+xml',
+    // Video
+    '.mp4': 'video/mp4',
+    '.mov': 'video/quicktime',
+    '.m4v': 'video/x-m4v',
+    '.webm': 'video/webm',
+    '.avi': 'video/x-msvideo',
+    '.mkv': 'video/x-matroska',
+    // Audio
+    '.wav': 'audio/wav',
+    '.mp3': 'audio/mpeg',
+    // Documents
+    '.txt': 'text/plain',
+    '.md': 'text/markdown',
+    '.csv': 'text/csv',
+    '.json': 'application/json',
+    '.xml': 'application/xml',
+    '.html': 'text/html',
+    '.pdf': 'application/pdf',
+};
+
+/**
+ * Detect MIME type from a file name extension
+ */
+export function detectMimeType(fileName: string): string {
+    const ext = fileName.lastIndexOf('.') >= 0
+        ? fileName.slice(fileName.lastIndexOf('.')).toLowerCase()
+        : '';
+    return mimeTypeMap[ext] || 'application/octet-stream';
+}
+
+/**
+ * Uploads a file to Google Drive from base64-encoded content.
+ * Designed for containerized MCP servers where the host filesystem is not accessible.
+ * Unlike uploadImageToDrive, does NOT make the file publicly readable —
+ * the file inherits the target folder's sharing settings.
+ *
+ * @param drive - Google Drive API client
+ * @param fileName - Name for the file in Drive
+ * @param fileContent - Base64-encoded file content
+ * @param mimeType - MIME type of the source content
+ * @param parentFolderId - Target folder ID in Drive
+ * @param convertToGoogleDoc - If true, converts the uploaded file to Google Docs format.
+ *   The source mimeType should be a format Drive can convert (text/html, text/plain,
+ *   application/rtf, application/vnd.openxmlformats-officedocument.wordprocessingml.document).
+ *   HTML provides the best formatting fidelity.
+ * @returns Object with fileId, webViewLink, and fileName
+ */
+export async function uploadFileToDrive(
+    drive: any, // drive_v3.Drive type
+    fileName: string,
+    fileContent: string,
+    mimeType: string,
+    parentFolderId: string,
+    convertToGoogleDoc: boolean = false
+): Promise<{ fileId: string; webViewLink: string; fileName: string; sizeBytes: number }> {
+    const { Readable } = await import('stream');
+
+    // Decode base64 to Buffer and wrap in a readable stream
+    const buffer = Buffer.from(fileContent, 'base64');
+    const stream = new Readable();
+    stream.push(buffer);
+    stream.push(null);
+
+    const fileMetadata: any = {
+        name: fileName,
+        parents: [parentFolderId],
+    };
+
+    // When converting, tell Drive the *target* format is Google Docs.
+    // The media mimeType stays as the *source* format (e.g. text/html).
+    if (convertToGoogleDoc) {
+        fileMetadata.mimeType = 'application/vnd.google-apps.document';
+    }
+
+    const media = {
+        mimeType: mimeType,
+        body: stream,
+    };
+
+    try {
+        const uploadResponse = await drive.files.create({
+            requestBody: fileMetadata,
+            media: media,
+            fields: 'id,webViewLink,name',
+            supportsAllDrives: true,
+        });
+
+        const fileId = uploadResponse.data.id;
+        if (!fileId) {
+            throw new Error('Failed to upload file to Drive — no file ID returned');
+        }
+
+        return {
+            fileId,
+            webViewLink: uploadResponse.data.webViewLink || `https://drive.google.com/file/d/${fileId}/view`,
+            fileName: uploadResponse.data.name || fileName,
+            sizeBytes: buffer.length,
+        };
+    } catch (error: any) {
+        if (error.code || error.response?.status) {
+            const errorInfo = classifyDriveError(error, `uploading "${fileName}"`);
+            throw new UserError(formatUploadError(errorInfo));
+        }
+        throw error;
+    }
+}
+
+/**
+ * Uploads a file to Google Drive from a local file path using streaming.
+ * Avoids base64 encoding overhead — reads the file directly from disk.
+ *
+ * @param drive - Google Drive API client
+ * @param filePath - Absolute path to the local file
+ * @param mimeType - MIME type of the file
+ * @param parentFolderId - Target folder ID in Drive
+ * @param convertToGoogleDoc - If true, converts to Google Docs format
+ * @returns Object with fileId, webViewLink, fileName, and sizeBytes
+ */
+export async function uploadFileFromPathToDrive(
+    drive: any, // drive_v3.Drive type
+    filePath: string,
+    mimeType: string,
+    parentFolderId: string,
+    convertToGoogleDoc: boolean = false
+): Promise<{ fileId: string; webViewLink: string; fileName: string; sizeBytes: number }> {
+    const fs = await import('fs');
+    const path = await import('path');
+
+    if (!fs.existsSync(filePath)) {
+        throw new UserError(`File not found: ${filePath}`);
+    }
+
+    const stat = fs.statSync(filePath);
+    const fileName = path.basename(filePath);
+
+    const fileMetadata: any = {
+        name: fileName,
+        parents: [parentFolderId],
+    };
+
+    if (convertToGoogleDoc) {
+        fileMetadata.mimeType = 'application/vnd.google-apps.document';
+    }
+
+    const media = {
+        mimeType: mimeType,
+        body: fs.createReadStream(filePath),
+    };
+
+    try {
+        const uploadResponse = await drive.files.create({
+            requestBody: fileMetadata,
+            media: media,
+            fields: 'id,webViewLink,name',
+            supportsAllDrives: true,
+        });
+
+        const fileId = uploadResponse.data.id;
+        if (!fileId) {
+            throw new Error('Failed to upload file to Drive — no file ID returned');
+        }
+
+        return {
+            fileId,
+            webViewLink: uploadResponse.data.webViewLink || `https://drive.google.com/file/d/${fileId}/view`,
+            fileName: uploadResponse.data.name || fileName,
+            sizeBytes: stat.size,
+        };
+    } catch (error: any) {
+        if (error.code || error.response?.status) {
+            const errorInfo = classifyDriveError(error, `uploading "${fileName}" from path`);
+            throw new UserError(formatUploadError(errorInfo));
+        }
+        throw error;
+    }
+}
+
+/**
+ * Verifies an uploaded file exists in Google Drive and returns its metadata.
+ *
+ * @param drive - Google Drive API client
+ * @param fileId - The ID of the file to verify
+ * @returns Verification result with file metadata
+ */
+export async function verifyUploadedFile(
+    drive: any, // drive_v3.Drive type
+    fileId: string
+): Promise<{
+    fileId: string;
+    webViewLink: string;
+    fileName: string;
+    mimeType: string;
+    size: string;
+    createdTime: string;
+    verified: boolean;
+}> {
+    try {
+        const response = await drive.files.get({
+            fileId,
+            fields: 'id,name,mimeType,size,createdTime,webViewLink',
+            supportsAllDrives: true,
+        });
+
+        return {
+            fileId: response.data.id || fileId,
+            webViewLink: response.data.webViewLink || `https://drive.google.com/file/d/${fileId}/view`,
+            fileName: response.data.name || 'unknown',
+            mimeType: response.data.mimeType || 'unknown',
+            size: response.data.size || 'unknown', // Google Docs native files don't report size
+            createdTime: response.data.createdTime || 'unknown',
+            verified: true,
+        };
+    } catch {
+        return {
+            fileId,
+            webViewLink: `https://drive.google.com/file/d/${fileId}/view`,
+            fileName: 'unknown',
+            mimeType: 'unknown',
+            size: 'unknown',
+            createdTime: 'unknown',
+            verified: false,
+        };
+    }
+}
+
+/**
+ * Downloads a file from Google Drive and returns its content as base64.
+ * This is the inverse of uploadFileToDrive — retrieves raw file bytes
+ * and encodes them for transport over MCP.
+ *
+ * @param drive - Google Drive API client
+ * @param fileId - The ID of the file to download
+ * @returns Object with base64-encoded content and size in bytes
+ */
+export async function downloadFileFromDrive(
+    drive: any, // drive_v3.Drive type
+    fileId: string,
+): Promise<{ content: string; sizeBytes: number }> {
+    const response = await drive.files.get(
+        {
+            fileId,
+            alt: 'media',
+            supportsAllDrives: true,
+        },
+        {
+            responseType: 'arraybuffer',
+        },
+    );
+
+    const buffer = Buffer.from(response.data as ArrayBuffer);
+    const base64String = buffer.toString('base64');
+
+    return {
+        content: base64String,
+        sizeBytes: buffer.length,
+    };
 }
 
 // --- Tab Management Helpers ---
